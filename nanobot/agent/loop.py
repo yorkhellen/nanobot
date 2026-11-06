@@ -34,7 +34,6 @@ from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, res
 from nanobot.agent.tools.message import capture_message_deliveries
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.runtime_control import AgentRuntimeControl
-from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.turn_delivery import (
     TurnDelivery,
     TurnDeliveryFactory,
@@ -452,6 +451,7 @@ class AgentLoop:
         )
         self._idle_compact_check_interval_s = idle_compact_check_interval_seconds
         self._next_idle_compact_check_at = time.monotonic()
+        self._idle_compact_check_running = False
         if model_preset:
             self.set_model_preset(model_preset, publish_update=False)
         self.commands = CommandRouter()
@@ -895,50 +895,6 @@ class AgentLoop:
             return
         await dispatch_and_publish()
 
-    async def execute_user_shell_command(self, ctx: CommandContext) -> OutboundMessage:
-        """Execute one trusted user command with the active workspace policy."""
-        metadata = dict(ctx.msg.metadata or {})
-        tool = self.tools.get("exec")
-        if not isinstance(tool, ExecTool):
-            content = "Shell execution is disabled in this nanobot configuration."
-        else:
-            session = ctx.session or await self.sessions.state.get(ctx.key)
-            scope = self.workspace_scopes.for_turn(
-                channel=ctx.msg.channel,
-                message_metadata=metadata,
-                session_metadata=session.metadata,
-            )
-            request_token = bind_request_context(RequestContext(
-                channel=ctx.msg.channel,
-                chat_id=ctx.msg.chat_id,
-                message_id=metadata.get("message_id"),
-                session_key=ctx.key,
-                session_generation=session.generation,
-                original_user_text=f"!{ctx.args.strip()}",
-                runtime=ctx.runtime,
-                metadata=metadata,
-                sender_id=ctx.msg.sender_id,
-                turn_id=metadata.get("webui_turn_id"),
-                workspace=scope.project_path,
-                log_content=session.policy.log_content,
-            ))
-            workspace_token = bind_workspace_scope(scope)
-            try:
-                result = await tool.execute_to_completion(
-                    command=ctx.args.strip(),
-                    working_dir=str(scope.project_path),
-                )
-                content = str(result)
-            finally:
-                reset_workspace_scope(workspace_token)
-                reset_request_context(request_token)
-        return OutboundMessage(
-            channel=ctx.msg.channel,
-            chat_id=ctx.msg.chat_id,
-            content=content,
-            metadata={**metadata, "render_as": "text"},
-        )
-
     def _track_active_task(self, key: str, task: asyncio.Task[Any]) -> None:
         tasks = self._active_tasks.setdefault(key, set())
         tasks.add(task)
@@ -1070,13 +1026,18 @@ class AgentLoop:
         request_context: RequestContext | None = None,
         provider_state: ProviderConversationState | None = None,
         initial_message: InboundMessage | None = None,
+        commit_session: bool = True,
     ) -> AgentRunResult:
         self._sync_subagent_runtime_limits()
 
         ephemeral = ephemeral or (session is not None and not session.policy.persist)
+        # Detached SDK turns can share a durable key without owning that session.
+        retain_session_state = (
+            commit_session and session is not None and (not ephemeral or not session.policy.persist)
+        )
 
         async def _checkpoint(payload: dict[str, Any]) -> None:
-            if session is None or ephemeral:
+            if session is None or not retain_session_state:
                 return
             public_payload = dict(payload)
             preceding = Session(key=session.key)
@@ -1084,6 +1045,7 @@ class AgentLoop:
             public_payload["preceding_messages"] = preceding.messages
             public_payload["consumed_followup_ids"] = sorted(preceding.consumed_followup_ids)
             private_state = public_payload.pop("provider_state", None)
+            previous_state = session.provider_state
             public_payload.pop(self._PROVIDER_STATE_CHECKPOINT_VERSION_KEY, None)
             if "provider_state" in payload and (
                 private_state is None
@@ -1093,7 +1055,11 @@ class AgentLoop:
                 public_payload[self._PROVIDER_STATE_CHECKPOINT_VERSION_KEY] = (
                     self._PROVIDER_STATE_CHECKPOINT_VERSION
                 )
-            await self._set_runtime_checkpoint(session, public_payload)
+            try:
+                await self._set_runtime_checkpoint(session, public_payload)
+            except BaseException:
+                session.provider_state = previous_state
+                raise
 
         async def _drain_pending(
             *,
@@ -1115,7 +1081,7 @@ class AgentLoop:
                 except asyncio.QueueEmpty:
                     break
 
-            async def _to_user_message(pending_msg: InboundMessage) -> dict[str, Any]:
+            async def _to_user_message(pending_msg: InboundMessage) -> dict[str, Any] | None:
                 content = pending_msg.content
                 image_paths = pending_msg.media if pending_msg.media else None
                 if image_paths:
@@ -1147,6 +1113,10 @@ class AgentLoop:
                         message_metadata=_prompt_scope_metadata(metadata),
                         session_metadata=_prompt_scope_metadata(session.metadata) if session is not None else None,
                     )
+                    # A follow-up cannot inherit another input's tool authority.
+                    # Leave it for the FIFO worker to run with its own scope.
+                    if scope != effective_scope:
+                        return None
                     pending_request = RequestContext(
                         channel=pending_msg.channel,
                         chat_id=pending_msg.chat_id,
@@ -1199,7 +1169,10 @@ class AgentLoop:
                     # owns completion, command dispatch, and control metadata.
                     if not self._can_inject_message(pending_msg):
                         break
-                    converted.append(await _to_user_message(pending_msg))
+                    row = await _to_user_message(pending_msg)
+                    if row is None:
+                        break
+                    converted.append(row)
                     consumed_inputs.append(pending_msg)
                 if execution_scope is not None:
                     try:
@@ -1373,7 +1346,7 @@ class AgentLoop:
             reset_workspace_scope(workspace_token)
             reset_request_context(request_token)
             reset_file_states(file_state_token)
-        if session is not None and not ephemeral:
+        if session is not None and retain_session_state:
             session.provider_state = result.provider_state
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", self.max_iterations)
@@ -1396,12 +1369,13 @@ class AgentLoop:
         return result
 
     async def _check_expired_sessions_if_due(self) -> None:
-        if self.bus.admission.paused:
+        if self.bus.admission.paused or self._idle_compact_check_running:
             return
         now = time.monotonic()
         if now < self._next_idle_compact_check_at:
             return
         self._next_idle_compact_check_at = now + self._idle_compact_check_interval_s
+        self._idle_compact_check_running = True
         try:
             with self.bus.admission.activity():
                 await self.auto_compact.check_expired(
@@ -1411,6 +1385,8 @@ class AgentLoop:
                 )
         except SessionOperationQueueFullError:
             logger.debug("Skipping idle archival while session storage is busy")
+        finally:
+            self._idle_compact_check_running = False
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -1425,7 +1401,9 @@ class AgentLoop:
                     async with asyncio.timeout(1.0):
                         msg = await self.bus.consume_inbound()
                 except asyncio.TimeoutError:
-                    await self._check_expired_sessions_if_due()
+                    # Storage may wait behind a turn that /stop needs to cancel.
+                    if not self.bus.admission.paused:
+                        self.schedule_background(self._check_expired_sessions_if_due())
                     continue
                 except asyncio.CancelledError:
                     # Preserve real task cancellation so shutdown can complete cleanly.
@@ -1795,7 +1773,8 @@ class AgentLoop:
                 if self._pending_queues.get(key) is pending:
                     self._pending_queues.pop(key)
                     await self._cancel_pending_messages(key, pending, asyncio.CancelledError())
-            if self._background_tasks:
+            # A scan can schedule archival while shutdown waits for it.
+            while self._background_tasks:
                 await asyncio.gather(*self._background_tasks, return_exceptions=True)
         except BaseException as exc:
             errors.append(exc)
@@ -2273,7 +2252,7 @@ class AgentLoop:
                 ])
             )
             if (
-                not ctx.ephemeral
+                (not ctx.ephemeral or not session.policy.persist)
                 and (ctx.kind is TurnKind.USER or subagent_followup_persisted)
             ):
                 session.provider_state = ctx.provider_state
@@ -2318,6 +2297,7 @@ class AgentLoop:
                 provider_state=ctx.provider_state,
                 initial_message=ctx.msg,
                 events=ctx.events,
+                commit_session=ctx.commit_session,
             )
         ctx.final_content = result.final_content
         ctx.all_messages = result.messages
@@ -2618,7 +2598,6 @@ class AgentLoop:
         session: Session,
         payload: dict[str, Any],
     ) -> None:
-        session.metadata[self._RUNTIME_CHECKPOINT_KEY] = payload
         await self.sessions.state.checkpoint_view(session, payload)
 
     def _mark_pending_user_turn(self, session: Session) -> None:
