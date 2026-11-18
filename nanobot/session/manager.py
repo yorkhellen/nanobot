@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import re
+import threading
+from collections.abc import Iterator, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -17,7 +19,6 @@ from nanobot.runtime_context import (
 from nanobot.session.display_history import HistoryFact, HistoryReader
 from nanobot.session.history_visibility import HIDDEN_HISTORY_META, is_hidden_history_message
 from nanobot.session.location import SessionLocation
-from nanobot.session.model_selection import SESSION_MODEL_PRESET_METADATA_KEY
 from nanobot.session.summary import SUMMARY_CONTINUATION_TEXT, is_summary_checkpoint
 from nanobot.session.types import PARENT_SESSION_KEY, SESSION_TYPE_KEY, SessionTypes
 from nanobot.utils.helpers import (
@@ -301,6 +302,12 @@ class Session:
                 if not any(key in message for key in ("tool_calls", "reasoning_content", "thinking_blocks")):
                     continue
             entry: dict[str, Any] = {"role": message["role"], "content": content}
+            if include_runtime_context and "input_id" in message and not is_hidden_history_message(message):
+                entry["_meta"] = {"input_id": message["input_id"]}
+            marker = message.get(HIDDEN_HISTORY_META)
+            if include_runtime_context and isinstance(marker, dict) and cast(dict[str, Any], marker).get("kind") == "internal_continuation":
+                # Attribution must distinguish persisted continuations from no-ID automation inputs.
+                entry[HIDDEN_HISTORY_META] = {"kind": "internal_continuation"}
             for key in ("tool_calls", "tool_call_id", "name", "reasoning_content", "thinking_blocks"):
                 if key in message:
                     entry[key] = message[key]
@@ -361,6 +368,10 @@ class SessionMetadataPayload(TypedDict):
     created_at: str | None
     updated_at: str | None
     metadata: dict[str, Any]
+
+
+class SessionHistoryPayload(SessionMetadataPayload):
+    generation: str
 
 
 class SessionInfo(TypedDict):
@@ -473,13 +484,8 @@ class SessionManager:
         return SessionLocation.safe_key(key)
 
     @staticmethod
-    def _storage_key(key: str) -> str:
-        """Collision-resistant encoding for internal session storage filenames."""
-        return SessionLocation.storage_key(key)
-
-    @staticmethod
     def _decode_storage_key(stem: str) -> str | None:
-        """Reverse _storage_key(): decode a base64url (no-padding) stem back to the original key."""
+        """Decode a base64url (no-padding) stem back to the original key."""
         return SessionLocation.decode_storage_key(stem)
 
     @staticmethod
@@ -509,6 +515,18 @@ class SessionManager:
         """Read persisted child headers without transcripts, checkpoints, or pending inputs."""
         return self._store.list_child_session_metadata(parent_key)
 
+    def list_subagent_session_metadata(
+        self, parent_key: str, *, turn_ids: Sequence[str],
+    ) -> list[SessionMetadataPayload]:
+        """Read persisted subagent headers attributed to the requested parent turns."""
+        return self._store.list_subagent_session_metadata(parent_key, turn_ids=turn_ids)
+
+    def read_child_session_metadata(
+        self, parent_key: str, child_keys: Sequence[str],
+    ) -> list[SessionMetadataPayload]:
+        """Read named persisted child headers without transcripts or pending inputs."""
+        return self._store.read_child_session_metadata(parent_key, child_keys)
+
     def save(self, session: Session) -> None:
         """Commit an offline administrative snapshot, rejecting obsolete history."""
         self._require_offline_mutation()
@@ -537,18 +555,7 @@ class SessionManager:
             return 0
         self._require_offline_mutation()
 
-        def rename() -> int:
-            changed = 0
-            for row in self._store.list_metadata():
-                if row["metadata"].get(SESSION_MODEL_PRESET_METADATA_KEY) == old_name:
-                    self._store.update_metadata(
-                        row["key"],
-                        {SESSION_MODEL_PRESET_METADATA_KEY: new_name},
-                    )
-                    changed += 1
-            return changed
-
-        return self._store.run_write(rename)
+        return len(self._store.rename_model_preset(old_name, new_name))
 
     def invalidate(self, key: str) -> None:
         if self._state is not None:
@@ -609,6 +616,37 @@ class SessionManager:
                 self._store.save(session)
             self._store.append_history(key, facts, expected_generation=session.generation)
         self._store.run_write(append)
+
+    def read_consistently(
+        self, operation: Callable[[], _T], *, cancelled: threading.Event | None = None,
+    ) -> _T:
+        """Run nested repository reads against one committed snapshot."""
+        return self._store.run_read(operation, cancelled=cancelled)
+
+    def read_batch(self, operation: Callable[[], _T]) -> _T:
+        """Reuse a connection without extending nested read snapshots."""
+        return self._store.run_read_batch(operation)
+
+    def read_history_header(self, key: str) -> SessionHistoryPayload | None:
+        """Read the metadata and generation needed by persisted history tools."""
+        return self._store.read_history_header(key)
+
+    def project_session_messages(
+        self,
+        key: str,
+        project: Callable[[SessionHistoryPayload, Iterator[tuple[int, dict[str, Any]]]], _T],
+    ) -> _T | None:
+        """Project a session header and reverse message stream within one snapshot.
+
+        The stream is valid only during the callback.
+        """
+        return self._store.project_session_messages(key, project)
+
+    def project_session_handle_names(
+        self, project: Callable[[Iterator[tuple[str, object]]], _T],
+    ) -> _T:
+        """Project stored handle names within the caller's read snapshot."""
+        return self._store.project_session_handle_names(project)
 
     def read_session_file(self, key: str) -> dict[str, Any] | None:
         """Read a session without populating the cache."""

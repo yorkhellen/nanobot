@@ -22,6 +22,7 @@ from nanobot.providers.base import (
     RetryStatusCallback,
 )
 from nanobot.providers.compaction import ProviderStateCommitError, provider_compaction_scope
+from nanobot.providers.model_options import ModelOptions
 from nanobot.providers.oauth_catalog_cache import oauth_catalog_auth_rejected
 from nanobot.providers.registry import find_by_name
 
@@ -223,7 +224,6 @@ class FallbackProvider(LLMProvider):
     async def _run_chat_with_retry(
         self,
         kw: dict[str, Any],
-        original_messages: list[dict[str, Any]],
         *,
         stream: bool,
         retry_mode: str,
@@ -293,7 +293,6 @@ class FallbackProvider(LLMProvider):
             return await self._retry_with_fallback(
                 _call_provider,
                 call_kwargs,
-                original_messages,
                 retry_mode=retry_mode,
                 on_retry_wait=on_retry_wait,
                 on_retry_exhausted=on_retry_exhausted,
@@ -348,7 +347,6 @@ class FallbackProvider(LLMProvider):
         self,
         call: Callable[[LLMProvider, dict[str, Any]], Awaitable[LLMResponse]],
         kwargs: dict[str, Any],
-        original_messages: list[dict[str, Any]],
         *,
         retry_mode: str,
         on_retry_wait: RetryEventCallback | None,
@@ -430,7 +428,6 @@ class FallbackProvider(LLMProvider):
         return await self._run_with_retry(
             _call_chain,
             dict(kwargs),
-            original_messages,
             retry_mode="persistent",
             on_retry_wait=on_retry_wait,
             on_retry_exhausted=on_retry_exhausted,
@@ -506,7 +503,12 @@ class FallbackProvider(LLMProvider):
         # continuation, so the incoming primary state remains reusable.
         preserve_primary_state = True
 
-        if self._primary_available():
+        has_images = self._request_contains_images(kwargs["messages"], kwargs.get("provider_context"))
+        image_error = self._primary._image_input_error(kwargs["messages"], kwargs.get("provider_context"))
+        if image_error is not None:
+            primary_response = image_error
+            primary_error = image_error.content or primary_error
+        elif self._primary_available():
             primary_was_attempted = True
             response, primary_exception = await self._call_provider(
                 call, self._primary, kwargs
@@ -563,6 +565,8 @@ class FallbackProvider(LLMProvider):
         last_response = primary_response
         primary_skipped = not primary_was_attempted
         for idx, fallback in enumerate(self._fallback_presets):
+            if has_images and not fallback.supports_images:
+                continue
             fallback_model = fallback.model
             if has_streamed is not None and has_streamed[0]:
                 is_timeout = (
@@ -579,7 +583,9 @@ class FallbackProvider(LLMProvider):
                     await on_stream_recover()
                 else:
                     break
-            if idx == 0 and primary_skipped:
+            if image_error is not None:
+                logger.info("Primary model '{}' does not accept images; trying '{}'", primary_model, fallback_model)
+            elif idx == 0 and primary_skipped:
                 logger.info(
                     "Primary model '{}' circuit open, trying fallback '{}'",
                     primary_model, fallback_model,
@@ -642,6 +648,7 @@ class FallbackProvider(LLMProvider):
                         if provider_context.response_preset is not None else None
                     ),
                     response_is_fallback=provider_context.response_preset is not None,
+                    model_options=ModelOptions(),
                 )
             if fallback.reasoning_effort is None:
                 fallback_kwargs.pop("reasoning_effort", None)

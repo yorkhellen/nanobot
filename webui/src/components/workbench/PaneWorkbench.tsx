@@ -8,6 +8,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import {
+  type CSSProperties,
   type FocusEvent,
   type KeyboardEvent,
   type PointerEvent as ReactPointerEvent,
@@ -49,6 +50,7 @@ export interface WorkbenchPane {
 
 interface PaneRenderContext {
   active: boolean;
+  multiplePanes: boolean;
   headerPortalTarget: HTMLElement | null | undefined;
   composerPortalTarget: HTMLElement | null | undefined;
   navigationFrame: HTMLElement | null | undefined;
@@ -204,6 +206,7 @@ export function PaneWorkbench({
 }: PaneWorkbenchProps) {
   const { t } = useTranslation();
   const compact = useMediaQuery("(max-width: 767px)");
+  const sharedComposer = chrome && panes.length > 1;
   const effectiveLayout = layout;
   const [headerPortalTarget, setHeaderPortalTarget] = useState<HTMLElement | null>(null);
   const [composerPortalTarget, setComposerPortalTarget] = useState<HTMLElement | null>(null);
@@ -721,12 +724,16 @@ export function PaneWorkbench({
                     "workbench-pane relative flex min-h-0 min-w-0 overflow-hidden bg-background",
                     chrome && displayedPanes.length > 1 && "shadow-[0_0_0_1px_hsl(var(--border)/0.55)]",
                   )}
-                  style={layoutGeometry.paneStyles[index]}
+                  style={{
+                    ...layoutGeometry.paneStyles[index],
+                    "--session-thread-name": `session-thread-${index}`,
+                  } as CSSProperties}
                 >
                   {renderPane(pane, {
                     active,
+                    multiplePanes: displayedPanes.length > 1,
                     headerPortalTarget: chrome && displayedPanes.length > 1 ? headerPortalTarget : undefined,
-                    composerPortalTarget: chrome ? composerPortalTarget : undefined,
+                    composerPortalTarget: sharedComposer ? composerPortalTarget : undefined,
                     navigationFrame: displayedPanes.length === 1 ? navigationFrame : undefined,
                     headerActions,
                   })}
@@ -825,7 +832,7 @@ export function PaneWorkbench({
           ) : null}
         </div>
 
-        {chrome ? (
+        {sharedComposer ? (
           <footer className="workbench-composer-footer shrink-0 px-3 pb-[calc(0.5rem+env(safe-area-inset-bottom))] sm:px-4 sm:pb-[calc(0.75rem+env(safe-area-inset-bottom))]">
             <div
               ref={setComposerPortalTarget}

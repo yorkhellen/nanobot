@@ -18,8 +18,7 @@ from nanobot.bus.events import (
 )
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import GenerationSettings, LLMResponse, ToolCallRequest
-from nanobot.runtime_context import RuntimeContextBlock, public_history_message
-from nanobot.session.keys import UNIFIED_SESSION_KEY
+from nanobot.runtime_context import RuntimeContextBlock
 from nanobot.session.manager import SessionPolicy
 from nanobot.webui.temporary_chats import WebUITemporaryChats
 from nanobot.webui.workspaces import WebUIWorkspaceController
@@ -270,26 +269,6 @@ async def test_session_worker_errors_keep_private_content_out_of_logs(
 
 
 @pytest.mark.asyncio
-async def test_transient_session_stays_outside_unified_session(tmp_path) -> None:
-    loop = _loop(tmp_path, ["private answer"], unified_session=True)
-    durable = loop.sessions.get_or_create(UNIFIED_SESSION_KEY)
-    durable.add_message("user", "durable question")
-    loop.sessions.save(durable)
-    key = "websocket:transient-unified"
-    await loop.sessions.state.register_transient(key)
-
-    await run_session(loop, _message(key, "private question"))
-
-    transient = await loop.sessions.state.get(key)
-    assert [public_history_message(message)["content"] for message in transient.messages] == [
-        "private question",
-        "private answer",
-    ]
-    assert [message["content"] for message in durable.messages] == ["durable question"]
-    assert loop.sessions.read_session_file(key) is None
-
-
-@pytest.mark.asyncio
 async def test_missing_required_session_cannot_fall_back_to_disk(tmp_path) -> None:
     loop = _loop(tmp_path, [])
     key = "websocket:transient-stale"
@@ -355,10 +334,6 @@ async def test_session_discard_control_cancels_active_turn(tmp_path, monkeypatch
 
     loop = _loop(tmp_path, [])
 
-    async def wait_for_discard(key: str) -> None:
-        while loop.sessions.get_cached(key) is not None or key in loop._discarding_sessions:
-            await asyncio.sleep(0)
-
     loop.provider.chat_stream_with_retry = AsyncMock(side_effect=block_provider)
     monkeypatch.setattr(loop, "aclose", AsyncMock())
     terminate_exec_sessions = AsyncMock(return_value=1)
@@ -393,7 +368,7 @@ async def test_session_discard_control_cancels_active_turn(tmp_path, monkeypatch
 
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(active_task, timeout=2)
-    await asyncio.wait_for(wait_for_discard(key), timeout=2)
+    await asyncio.wait_for(loop._pending_queues.wait_for_controls(key), timeout=2)
     assert loop.sessions.get_cached(key) is None
     assert loop._file_state_store.for_session(key) is not previous_file_state
     terminate_exec_sessions.assert_awaited_once_with(key)

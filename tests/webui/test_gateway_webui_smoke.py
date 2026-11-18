@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -86,6 +87,64 @@ async def test_remote_proxy_with_real_gateway_chat_settings_and_renewal(
         if proxy is not None:
             await proxy.close()
         _stop_gateway(process)
+
+
+# Test-only injection: report locations without task names, frame data or source.
+_TASK_DIAGNOSTICS = """
+import asyncio, os, signal, sys
+if sys.platform.startswith('linux') and os.name == 'posix':
+    original_run = asyncio.run
+    def diagnostic_run(coro, *args, **kwargs):
+        async def wrapped():
+            loop = asyncio.get_running_loop()
+            def dump_tasks():
+                with open(os.environ['SMOKE_TASK_DIAGNOSTICS'], 'w', encoding='utf-8') as output:
+                    print('Gateway async task locations:', file=output)
+                    for number, task in enumerate(asyncio.all_tasks(loop), 1):
+                        for frame in task.get_stack():
+                            code = frame.f_code
+                            print(f'{number} {os.path.basename(code.co_filename)} {code.co_name} {frame.f_lineno}', file=output)
+                    print('Gateway async task locations end', file=output)
+            loop.add_signal_handler(signal.SIGUSR1, dump_tasks)
+            return await coro
+        return original_run(wrapped(), *args, **kwargs)
+    asyncio.run = diagnostic_run
+"""
+
+
+async def _stop_inline_gateway(process: subprocess.Popen[bytes], *, diagnostics: Path, timeout: float = 30) -> None:
+    if process.poll() is not None:
+        return
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                       capture_output=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+    else:
+        process.terminate()
+    try:
+        await asyncio.to_thread(process.wait, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            if sys.platform.startswith("linux") and os.name == "posix":
+                try:
+                    process.send_signal(signal.SIGUSR1)
+                    await asyncio.to_thread(process.wait, timeout=1)
+                except (ProcessLookupError, subprocess.TimeoutExpired):
+                    pass
+        finally:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            finally:
+                await asyncio.to_thread(process.wait, timeout=10)
+        if diagnostics.exists():
+            print(diagnostics.read_text(encoding="utf-8"))
+        stacks = diagnostics.with_name("gateway-stacks.log")
+        if stacks.exists():
+            frames = re.findall(r'File "[^"\n]*[/\\]([^/\\"\n]+)", line (\d+) in (\w+)',
+                                stacks.read_text(encoding="utf-8"))
+            print("Gateway shutdown stack locations:", frames[-80:])
+        raise
 
 
 def _free_port() -> int:
@@ -228,6 +287,11 @@ async def test_gateway_webui_bootstrap_message_and_thread_hydration(tmp_path: Pa
         gateway_port=gateway_port,
     )
 
+    legacy_config = json.loads(config_path.read_text(encoding="utf-8"))
+    legacy_config["api"] = {"host": "0.0.0.0", "apiKey": "${RETIRED_SMOKE_TOKEN}"}
+    config_path.write_text(json.dumps(legacy_config), encoding="utf-8")
+    before = config_path.read_bytes()
+
     process = _start_gateway(config_path, log_path)
     base_url = f"http://127.0.0.1:{ws_port}"
     try:
@@ -238,6 +302,17 @@ async def test_gateway_webui_bootstrap_message_and_thread_hydration(tmp_path: Pa
         async with websockets.connect(ws_url) as ws:
             ready = await _recv_until(ws, "ready")
             assert ready["client_id"] == "smoke"
+
+            # An old WebUI can still connect, but cannot start the retired listener.
+            await ws.send(json.dumps({
+                "type": "webui_request", "request_id": "old-api-start",
+                "action": "settings.api_service.start",
+                "payload": {"host": "127.0.0.1", "port": _free_port(), "timeout": 120},
+            }))
+            rejected = await _recv_until(ws, "webui_response")
+            assert rejected["request_id"] == "old-api-start"
+            assert rejected["ok"] is False and rejected["error"]["status"] == 404
+            assert config_path.read_bytes() == before
 
             await ws.send(json.dumps({"type": "new_chat"}))
             attached = await _recv_until(ws, "attached")
@@ -481,12 +556,14 @@ def test_gateway_restart_restores_a_completed_answer_without_replaying_model(
 async def test_real_gateway_goal_single_run_and_stop(tmp_path: Path, stop_during_checkpoint: bool) -> None:
     """Exercise the actual gateway and WebSocket with a synthetic local model."""
     checkpoint_waiting = asyncio.Event()
+    release_checkpoint = asyncio.Event()
     closing_request = asyncio.Event()
     release_close = asyncio.Event()
     requests: list[dict] = []
 
     async def barrier(_request: web.Request) -> web.Response:
         checkpoint_waiting.set()
+        await release_checkpoint.wait()
         return web.Response(text="ready")
 
     async def model(request: web.Request) -> web.StreamResponse:
@@ -564,8 +641,9 @@ async def test_real_gateway_goal_single_run_and_stop(tmp_path: Path, stop_during
     config = json.loads(config_path.read_text(encoding="utf-8"))
     config["providers"]["custom"]["apiBase"] = f"http://127.0.0.1:{model_port}/v1"
     config_path.write_text(json.dumps(config), encoding="utf-8")
-    launcher = """
-import asyncio, sys, urllib.request
+    launcher = _TASK_DIAGNOSTICS + """
+import asyncio, faulthandler, httpx, sys
+from pathlib import Path
 from nanobot.session.state import SessionState
 original = SessionState.checkpoint_view
 barrier_url = sys.argv[3]
@@ -576,21 +654,27 @@ async def checkpoint(self, session, payload):
     results = payload.get('completed_tool_results', [])
     if barrier_url and not held and results and results[-1].get('tool_call_id') == 'call-16':
         held = True
-        def signal():
-            with urllib.request.urlopen(barrier_url) as response:
-                response.read()
-        await asyncio.to_thread(signal)
+        async with httpx.AsyncClient(trust_env=False, timeout=20) as client:
+            response = await client.get(barrier_url)
+            response.raise_for_status()
         await asyncio.Event().wait()
 SessionState.checkpoint_view = checkpoint
 home, config = sys.argv[1:3]
 sys.argv = ['nanobot', '--home', home, 'gateway', '--config', config]
 from nanobot.cli.entry import main
-main()
+with Path(config).with_name('gateway-stacks.log').open('w') as stacks:
+    faulthandler.dump_traceback_later(10, repeat=True, file=stacks)
+    try:
+        main()
+    finally:
+        faulthandler.cancel_dump_traceback_later()
 """
     env = {key: value for key, value in os.environ.items() if not key.startswith("NANOBOT_")}
     env.update({"HOME": str(home), "USERPROFILE": str(home), "APPDATA": str(home),
                 "LOCALAPPDATA": str(home), "TMP": str(tmp_path), "TEMP": str(tmp_path),
                 "NO_PROXY": "localhost,127.0.0.1", "no_proxy": "localhost,127.0.0.1"})
+    diagnostics = tmp_path / "gateway-tasks.log"
+    env["SMOKE_TASK_DIAGNOSTICS"] = str(diagnostics)
     creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     process = None
     try:
@@ -621,6 +705,15 @@ main()
                         events.append(event)
                         if predicate(event):
                             return event
+
+            # Bound each model round, not all 16 durable rounds with one deadline.
+            # Drain the real client while the gateway advances to the stop barrier.
+            for request_count in range(1, 17):
+                await receive_until(lambda event: (
+                    event.get("event") == "model_request"
+                    and event.get("phase") == "completed"
+                    and event.get("usage", {}).get("request_count") == request_count
+                ))
 
             if stop_during_checkpoint:
                 await asyncio.wait_for(checkpoint_waiting.wait(), 20)
@@ -682,11 +775,55 @@ main()
                     assert state["goal_state"] == {"active": False}
     finally:
         release_close.set()
-        if process is not None and process.poll() is None:
-            if sys.platform == "win32":
-                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                               capture_output=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
-            else:
-                process.terminate()
-            process.wait(timeout=30)
-        await server.cleanup()
+        release_checkpoint.set()
+        try:
+            if process is not None:
+                # Keep the model/barrier server live while its client exits.
+                await _stop_inline_gateway(process, diagnostics=diagnostics)
+        finally:
+            await server.cleanup()
+
+
+@pytest.mark.skipif(not (sys.platform.startswith("linux") and os.name == "posix"), reason="Linux signals only")
+@pytest.mark.asyncio
+async def test_inline_gateway_timeout_dumps_tasks_and_reaps(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    (tmp_path / "gateway-stacks.log").write_text(
+        'Thread secret\n  File "/private/path/gateway.py", line 42 in blocked\n    secret source\n'
+    )
+    log_path = tmp_path / "diagnostic.log"
+    diagnostics = tmp_path / "tasks.log"
+    script = _TASK_DIAGNOSTICS + """
+async def blocked():
+    secret_variable = 'must-not-appear-in-diagnostics'
+    await asyncio.Event().wait()
+async def main():
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    asyncio.create_task(blocked(), name='private-task-name')
+    print('ready', flush=True)
+    await asyncio.Event().wait()
+asyncio.run(main())
+"""
+    with log_path.open("wb") as log:
+        process = subprocess.Popen([sys.executable, "-c", script], stdout=log, stderr=subprocess.STDOUT,
+                                   env={**os.environ, "SMOKE_TASK_DIAGNOSTICS": str(diagnostics)})
+    try:
+        deadline = time.monotonic() + 5
+        while "ready" not in log_path.read_text() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert "ready" in log_path.read_text()
+        with pytest.raises(subprocess.TimeoutExpired):
+            await _stop_inline_gateway(process, diagnostics=diagnostics, timeout=0.1)
+        assert process.returncode is not None
+        captured = capsys.readouterr().out
+        assert "('gateway.py', '42', 'blocked')" in captured
+        assert "/private/path" not in captured
+        assert "secret source" not in captured
+        output = diagnostics.read_text()
+        assert "Gateway async task locations end" in output
+        assert "<string> blocked " in output
+        assert "private-task-name" not in output
+        assert "must-not-appear-in-diagnostics" not in output
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=10)
